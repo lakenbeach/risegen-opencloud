@@ -1,0 +1,72 @@
+# OpenCloud — Local Development Stack
+# Generic docker-compose for any project adopting OpenCloud.
+# NO project-specific names or init scripts.
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: opencloud-minio
+    command: server /data --console-address ":19001"
+    ports:
+      - "19000:9000"
+      - "19001:19001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  nats:
+    image: nats:latest
+    container_name: opencloud-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["--http_port", "8222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: opencloud-redis
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  scylladb:
+    image: scylladb/scylla:latest
+    container_name: opencloud-scylladb
+    command:
+      - "--alternator-port"
+      - "8000"
+      - "--alternator-write-isolation"
+      - "always"
+    ports:
+      - "18000:8000"
+    volumes:
+      - scylla-data:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  minio-data:
+  scylla-data:

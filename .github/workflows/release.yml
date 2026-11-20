@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  GO_VERSION: "1.23"
+  PYTHON_VERSION: "3.11"
+
+permissions:
+  contents: write
+
+jobs:
+  build-amd64:
+    name: Build linux/amd64
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run Go tests
+        run: go test ./... -race -count=1
+
+      - name: Build shared library (amd64)
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p build
+          go build -buildmode=c-shared -o build/libcloudadapter-linux-amd64.so ./cmd/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcloudadapter-linux-amd64
+          path: go/build/libcloudadapter-linux-amd64.so
+
+  build-arm64:
+    name: Build linux/arm64
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build shared library (arm64)
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: arm64
+          CC: aarch64-linux-gnu-gcc
+        run: |
+          mkdir -p build
+          go build -buildmode=c-shared -o build/libcloudadapter-linux-arm64.so ./cmd/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcloudadapter-linux-arm64
+          path: go/build/libcloudadapter-linux-arm64.so
+
+  release:
+    name: Create Release
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libcloudadapter-linux-amd64
+          path: artifacts/
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libcloudadapter-linux-arm64
+          path: artifacts/
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.so > checksums.txt
+
+      - name: Extract tag info
+        id: tag
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "version_no_v=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.version }}
+          name: OpenCloud ${{ steps.tag.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.version, '-') }}
+          files: |
+            artifacts/libcloudadapter-linux-amd64.so
+            artifacts/libcloudadapter-linux-arm64.so
+            artifacts/checksums.txt
+          body: |
+            ## OpenCloud ${{ steps.tag.outputs.version }}
+
+            ### Downloads
+
+            | Platform       | File                                |
+            |----------------|-------------------------------------|
+            | linux/amd64    | `libcloudadapter-linux-amd64.so`    |
+            | linux/arm64    | `libcloudadapter-linux-arm64.so`    |
+
+            ### Installation
+
+            ```bash
+            # Download the appropriate .so for your platform
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.version }}/libcloudadapter-linux-amd64.so
+
+            # Install Python package
+            pip install opencloud-adapter==${{ steps.tag.outputs.version_no_v }}
+            ```
+
+            ### Checksums
+
+            See `checksums.txt` for SHA-256 hashes.
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: ${{ vars.PUBLISH_PYPI == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build package
+        run: python -m build
+        working-directory: python/
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload python/dist/*

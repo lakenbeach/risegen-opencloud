@@ -1,0 +1,38 @@
+# Go
+go/build/
+*.so
+*.h
+!go/pkg/cbridge/bridge.h
+go/vendor/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/data/
+
+# Misc
+*.log
+.pr-description.md
