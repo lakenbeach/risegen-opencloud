@@ -54,19 +54,22 @@ def test_wrapper_loads_from_env_var():
             CloudAdapterBase()
 
 
-def test_wrapper_default_so_path(tmp_path):
-    """Verify the default .so path falls back to ./libcloudadapter.so."""
-    monkeypatch_cwd = os.getcwd()
-    os.chdir(tmp_path)
-    try:
-        with mock.patch.dict(os.environ):
-            os.environ.pop("OPENCLD_SO_PATH", None)
-            with pytest.raises(CloudAdapterNotAvailable) as exc_info:
-                CloudAdapterBase()
+def test_wrapper_default_so_path():
+    """Verify the default .so path falls back to ./libcloudadapter.so.
 
-        assert "libcloudadapter.so" in str(exc_info.value)
-    finally:
-        os.chdir(monkeypatch_cwd)
+    The resolution is pure (env var -> package dir -> cwd-relative fallback),
+    so we assert it directly. We deliberately do NOT assert that constructing
+    from an empty cwd raises: glibc's ``dlopen`` caches already-loaded objects
+    by name, so a relative ``./libcloudadapter.so`` can resolve to a handle
+    loaded earlier in the process even after ``os.chdir`` to an empty
+    directory. The "missing library raises" path is covered by
+    ``test_wrapper_loads_so_library`` with an explicit path.
+    """
+    from opencloud.adapter import _default_so_path
+
+    with mock.patch.dict(os.environ):
+        os.environ.pop("OPENCLD_SO_PATH", None)
+        assert _default_so_path() == "./libcloudadapter.so"
 
 
 def test_error_classes_exist():
