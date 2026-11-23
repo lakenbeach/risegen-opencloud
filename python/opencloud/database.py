@@ -594,8 +594,15 @@ class NativeDynamoTable:
         ExpressionAttributeValues: Optional[Dict[str, Any]] = None,
         Limit: int = 0,
         ExclusiveStartKey: Optional[Dict[str, Any]] = None,
+        ProjectionExpression: str = "",
     ) -> Dict[str, Any]:
-        """Full table scan.  Same response shape as ``query``."""
+        """Full table scan.  Same response shape as ``query``.
+
+        ``ProjectionExpression`` (comma-separated attribute names, ``#alias``
+        resolved via ``ExpressionAttributeNames``) is applied client-side;
+        empty means whole items.  ``LastEvaluatedKey`` is passed through from
+        the Go result when present.
+        """
         # Scan is implemented as a NativeQuery with no key condition.
         # The Go NativeQuery needs a pk_field, so we pass empty strings which
         # makes the Go side build an invalid expression.  Instead, use the
@@ -622,8 +629,29 @@ class NativeDynamoTable:
                 ExpressionAttributeNames or {},
                 ExpressionAttributeValues or {},
             )
+        # Client-side projection (Go scan doesn't support ProjectionExpression)
+        if ProjectionExpression:
+            items = self._apply_projection(
+                items, ProjectionExpression, ExpressionAttributeNames or {},
+            )
         resp: Dict[str, Any] = {"Items": items, "Count": len(items)}
+        if isinstance(result, dict):
+            lek = result.get("last_evaluated_key")
+            if lek:
+                resp["LastEvaluatedKey"] = lek
         return resp
+
+    @staticmethod
+    def _apply_projection(items: list, expr: str, names: Dict[str, str]) -> list:
+        """Project each item to the comma-separated attributes in ``expr``,
+        resolving ``#alias`` via ``names``.  Absent attributes are omitted
+        (boto3-compatible)."""
+        fields = []
+        for part in expr.split(","):
+            part = part.strip()
+            if part:
+                fields.append(names.get(part, part))
+        return [{f: item[f] for f in fields if f in item} for item in items]
 
     @staticmethod
     def _apply_client_filter(
