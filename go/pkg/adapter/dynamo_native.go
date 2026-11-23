@@ -6,6 +6,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -515,4 +516,323 @@ func toStringMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Schema management (CreateTable / DescribeTable / UpdateTable / DeleteTable /
+// UpdateTimeToLive). These are client-level operations: they work even when the
+// table does not yet exist, so they do not depend on a registered table handle.
+// GSI/LSI are defined at CreateTable time (ScyllaDB Alternator does not support
+// adding GSI via UpdateTable GlobalSecondaryIndexUpdates).
+// ---------------------------------------------------------------------------
+
+type keySchemaElementJSON struct {
+	AttributeName string `json:"AttributeName"`
+	KeyType       string `json:"KeyType"`
+}
+
+type attributeDefinitionJSON struct {
+	AttributeName string `json:"AttributeName"`
+	AttributeType string `json:"AttributeType"`
+}
+
+type provisionedThroughputJSON struct {
+	ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
+	WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+}
+
+type projectionJSON struct {
+	ProjectionType   string   `json:"ProjectionType"`
+	NonKeyAttributes []string `json:"NonKeyAttributes"`
+}
+
+type secondaryIndexJSON struct {
+	IndexName             string                     `json:"IndexName"`
+	KeySchema             []keySchemaElementJSON     `json:"KeySchema"`
+	Projection            projectionJSON             `json:"Projection"`
+	ProvisionedThroughput *provisionedThroughputJSON `json:"ProvisionedThroughput"`
+}
+
+func keySchemaFromElements(raw []keySchemaElementJSON) []types.KeySchemaElement {
+	out := make([]types.KeySchemaElement, 0, len(raw))
+	for _, e := range raw {
+		out = append(out, types.KeySchemaElement{
+			AttributeName: aws.String(e.AttributeName),
+			KeyType:       types.KeyType(e.KeyType),
+		})
+	}
+	return out
+}
+
+// ParseKeySchema parses a boto3-shaped KeySchema JSON list.
+func ParseKeySchema(s string) ([]types.KeySchemaElement, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var raw []keySchemaElementJSON
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, err
+	}
+	return keySchemaFromElements(raw), nil
+}
+
+// ParseAttributeDefinitions parses a boto3-shaped AttributeDefinitions JSON list.
+func ParseAttributeDefinitions(s string) ([]types.AttributeDefinition, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var raw []attributeDefinitionJSON
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, err
+	}
+	out := make([]types.AttributeDefinition, 0, len(raw))
+	for _, e := range raw {
+		out = append(out, types.AttributeDefinition{
+			AttributeName: aws.String(e.AttributeName),
+			AttributeType: types.ScalarAttributeType(e.AttributeType),
+		})
+	}
+	return out, nil
+}
+
+// ParseProvisionedThroughput parses a boto3-shaped ProvisionedThroughput JSON.
+func ParseProvisionedThroughput(s string) (*types.ProvisionedThroughput, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var raw provisionedThroughputJSON
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, err
+	}
+	return &types.ProvisionedThroughput{
+		ReadCapacityUnits:  aws.Int64(raw.ReadCapacityUnits),
+		WriteCapacityUnits: aws.Int64(raw.WriteCapacityUnits),
+	}, nil
+}
+
+func projectionFromJSON(p projectionJSON) *types.Projection {
+	proj := &types.Projection{ProjectionType: types.ProjectionType(p.ProjectionType)}
+	if len(p.NonKeyAttributes) > 0 {
+		proj.NonKeyAttributes = p.NonKeyAttributes
+	}
+	return proj
+}
+
+// ParseGlobalSecondaryIndexes parses a boto3-shaped GlobalSecondaryIndexes JSON
+// list, preserving IndexName, KeySchema, Projection and ProvisionedThroughput.
+func ParseGlobalSecondaryIndexes(s string) ([]types.GlobalSecondaryIndex, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var raw []secondaryIndexJSON
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, err
+	}
+	out := make([]types.GlobalSecondaryIndex, 0, len(raw))
+	for _, g := range raw {
+		idx := types.GlobalSecondaryIndex{
+			IndexName:  aws.String(g.IndexName),
+			KeySchema:  keySchemaFromElements(g.KeySchema),
+			Projection: projectionFromJSON(g.Projection),
+		}
+		if g.ProvisionedThroughput != nil {
+			idx.ProvisionedThroughput = &types.ProvisionedThroughput{
+				ReadCapacityUnits:  aws.Int64(g.ProvisionedThroughput.ReadCapacityUnits),
+				WriteCapacityUnits: aws.Int64(g.ProvisionedThroughput.WriteCapacityUnits),
+			}
+		}
+		out = append(out, idx)
+	}
+	return out, nil
+}
+
+// ParseLocalSecondaryIndexes parses a boto3-shaped LocalSecondaryIndexes JSON list.
+func ParseLocalSecondaryIndexes(s string) ([]types.LocalSecondaryIndex, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var raw []secondaryIndexJSON
+	if err := json.Unmarshal([]byte(s), &raw); err != nil {
+		return nil, err
+	}
+	out := make([]types.LocalSecondaryIndex, 0, len(raw))
+	for _, l := range raw {
+		out = append(out, types.LocalSecondaryIndex{
+			IndexName:  aws.String(l.IndexName),
+			KeySchema:  keySchemaFromElements(l.KeySchema),
+			Projection: projectionFromJSON(l.Projection),
+		})
+	}
+	return out, nil
+}
+
+// NativeCreateTable creates a table with the given key schema, attribute
+// definitions, GSI/LSI and billing mode. GSI/LSI are passed through intact.
+func NativeCreateTable(
+	ctx context.Context,
+	client *NativeDynamoClient,
+	tableName string,
+	keySchema []types.KeySchemaElement,
+	attributeDefinitions []types.AttributeDefinition,
+	gsis []types.GlobalSecondaryIndex,
+	lsis []types.LocalSecondaryIndex,
+	billingMode string,
+	throughput *types.ProvisionedThroughput,
+) error {
+	input := &dynamodb.CreateTableInput{
+		TableName:            aws.String(tableName),
+		KeySchema:            keySchema,
+		AttributeDefinitions: attributeDefinitions,
+	}
+	if len(gsis) > 0 {
+		input.GlobalSecondaryIndexes = gsis
+	}
+	if len(lsis) > 0 {
+		input.LocalSecondaryIndexes = lsis
+	}
+	if billingMode != "" {
+		input.BillingMode = types.BillingMode(billingMode)
+	}
+	if throughput != nil {
+		input.ProvisionedThroughput = throughput
+	}
+	if _, err := client.Client.CreateTable(ctx, input); err != nil {
+		return classifyDatabaseError("NATIVE_CREATE_TABLE", err)
+	}
+	return nil
+}
+
+func keySchemaToMaps(ks []types.KeySchemaElement) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(ks))
+	for _, e := range ks {
+		out = append(out, map[string]interface{}{
+			"AttributeName": aws.ToString(e.AttributeName),
+			"KeyType":       string(e.KeyType),
+		})
+	}
+	return out
+}
+
+// NativeDescribeTable returns a boto3-shaped description of the table.
+func NativeDescribeTable(
+	ctx context.Context,
+	client *NativeDynamoClient,
+	tableName string,
+) (map[string]interface{}, error) {
+	out, err := client.Client.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(tableName),
+	})
+	if err != nil {
+		return nil, classifyDatabaseError("NATIVE_DESCRIBE_TABLE", err)
+	}
+	t := out.Table
+	if t == nil {
+		return nil, fmt.Errorf("describe table %q returned no table description", tableName)
+	}
+	attrDefs := make([]map[string]interface{}, 0, len(t.AttributeDefinitions))
+	for _, e := range t.AttributeDefinitions {
+		attrDefs = append(attrDefs, map[string]interface{}{
+			"AttributeName": aws.ToString(e.AttributeName),
+			"AttributeType": string(e.AttributeType),
+		})
+	}
+	gsis := make([]map[string]interface{}, 0, len(t.GlobalSecondaryIndexes))
+	for _, g := range t.GlobalSecondaryIndexes {
+		gm := map[string]interface{}{
+			"IndexName": aws.ToString(g.IndexName),
+			"KeySchema": keySchemaToMaps(g.KeySchema),
+		}
+		if g.Projection != nil {
+			gm["Projection"] = map[string]interface{}{
+				"ProjectionType": string(g.Projection.ProjectionType),
+			}
+		}
+		gsis = append(gsis, gm)
+	}
+	lsis := make([]map[string]interface{}, 0, len(t.LocalSecondaryIndexes))
+	for _, l := range t.LocalSecondaryIndexes {
+		lm := map[string]interface{}{
+			"IndexName": aws.ToString(l.IndexName),
+			"KeySchema": keySchemaToMaps(l.KeySchema),
+		}
+		if l.Projection != nil {
+			lm["Projection"] = map[string]interface{}{
+				"ProjectionType": string(l.Projection.ProjectionType),
+			}
+		}
+		lsis = append(lsis, lm)
+	}
+	desc := map[string]interface{}{
+		"TableName":              aws.ToString(t.TableName),
+		"TableStatus":            string(t.TableStatus),
+		"KeySchema":              keySchemaToMaps(t.KeySchema),
+		"AttributeDefinitions":   attrDefs,
+		"GlobalSecondaryIndexes": gsis,
+		"LocalSecondaryIndexes":  lsis,
+		"ItemCount":              aws.ToInt64(t.ItemCount),
+		"TableArn":               aws.ToString(t.TableArn),
+	}
+	if t.BillingModeSummary != nil {
+		desc["BillingMode"] = string(t.BillingModeSummary.BillingMode)
+	}
+	if t.ProvisionedThroughput != nil {
+		desc["ProvisionedThroughput"] = map[string]interface{}{
+			"ReadCapacityUnits":  aws.ToInt64(t.ProvisionedThroughput.ReadCapacityUnits),
+			"WriteCapacityUnits": aws.ToInt64(t.ProvisionedThroughput.WriteCapacityUnits),
+		}
+	}
+	return desc, nil
+}
+
+// NativeUpdateTable updates billing mode / provisioned throughput only. GSI
+// addition via UpdateTable is intentionally NOT supported (Alternator requires
+// GSI at CreateTable); the caller rejects GlobalSecondaryIndexUpdates upstream.
+func NativeUpdateTable(
+	ctx context.Context,
+	client *NativeDynamoClient,
+	tableName string,
+	billingMode string,
+	throughput *types.ProvisionedThroughput,
+) error {
+	input := &dynamodb.UpdateTableInput{TableName: aws.String(tableName)}
+	if billingMode != "" {
+		input.BillingMode = types.BillingMode(billingMode)
+	}
+	if throughput != nil {
+		input.ProvisionedThroughput = throughput
+	}
+	if _, err := client.Client.UpdateTable(ctx, input); err != nil {
+		return classifyDatabaseError("NATIVE_UPDATE_TABLE", err)
+	}
+	return nil
+}
+
+// NativeDeleteTable deletes a table.
+func NativeDeleteTable(ctx context.Context, client *NativeDynamoClient, tableName string) error {
+	if _, err := client.Client.DeleteTable(ctx, &dynamodb.DeleteTableInput{
+		TableName: aws.String(tableName),
+	}); err != nil {
+		return classifyDatabaseError("NATIVE_DELETE_TABLE", err)
+	}
+	return nil
+}
+
+// NativeUpdateTimeToLive enables/disables TTL on the given attribute.
+func NativeUpdateTimeToLive(
+	ctx context.Context,
+	client *NativeDynamoClient,
+	tableName string,
+	enabled bool,
+	attributeName string,
+) error {
+	if _, err := client.Client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
+		TableName: aws.String(tableName),
+		TimeToLiveSpecification: &types.TimeToLiveSpecification{
+			Enabled:       aws.Bool(enabled),
+			AttributeName: aws.String(attributeName),
+		},
+	}); err != nil {
+		return classifyDatabaseError("NATIVE_UPDATE_TTL", err)
+	}
+	return nil
 }
