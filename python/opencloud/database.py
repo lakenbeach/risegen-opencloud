@@ -594,8 +594,15 @@ class NativeDynamoTable:
         ExpressionAttributeValues: Optional[Dict[str, Any]] = None,
         Limit: int = 0,
         ExclusiveStartKey: Optional[Dict[str, Any]] = None,
+        ProjectionExpression: str = "",
     ) -> Dict[str, Any]:
-        """Full table scan.  Same response shape as ``query``."""
+        """Full table scan.  Same response shape as ``query``.
+
+        ``ProjectionExpression`` (comma-separated attribute names, ``#alias``
+        resolved via ``ExpressionAttributeNames``) is applied client-side;
+        empty means whole items.  ``LastEvaluatedKey`` is passed through from
+        the Go result when present.
+        """
         # Scan is implemented as a NativeQuery with no key condition.
         # The Go NativeQuery needs a pk_field, so we pass empty strings which
         # makes the Go side build an invalid expression.  Instead, use the
@@ -622,8 +629,29 @@ class NativeDynamoTable:
                 ExpressionAttributeNames or {},
                 ExpressionAttributeValues or {},
             )
+        # Client-side projection (Go scan doesn't support ProjectionExpression)
+        if ProjectionExpression:
+            items = self._apply_projection(
+                items, ProjectionExpression, ExpressionAttributeNames or {},
+            )
         resp: Dict[str, Any] = {"Items": items, "Count": len(items)}
+        if isinstance(result, dict):
+            lek = result.get("last_evaluated_key")
+            if lek:
+                resp["LastEvaluatedKey"] = lek
         return resp
+
+    @staticmethod
+    def _apply_projection(items: list, expr: str, names: Dict[str, str]) -> list:
+        """Project each item to the comma-separated attributes in ``expr``,
+        resolving ``#alias`` via ``names``.  Absent attributes are omitted
+        (boto3-compatible)."""
+        fields = []
+        for part in expr.split(","):
+            part = part.strip()
+            if part:
+                fields.append(names.get(part, part))
+        return [{f: item[f] for f in fields if f in item} for item in items]
 
     @staticmethod
     def _apply_client_filter(
@@ -722,6 +750,42 @@ class NativeDynamoTable:
     def batch_writer(self) -> "_NativeBatchWriter":
         return _NativeBatchWriter(self)
 
+    # ------------------------------------------------------------------
+    # schema management (delegate to the module-level functions below)
+    # ------------------------------------------------------------------
+    def describe_table(self) -> Dict[str, Any]:
+        return describe_table(
+            self.table_name, provider_config=self.provider_config, adapter=self.adapter
+        )
+
+    def update_table(
+        self,
+        BillingMode: Optional[str] = None,
+        ProvisionedThroughput: Optional[Dict[str, Any]] = None,
+        GlobalSecondaryIndexUpdates: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        return update_table(
+            self.table_name,
+            BillingMode=BillingMode,
+            ProvisionedThroughput=ProvisionedThroughput,
+            GlobalSecondaryIndexUpdates=GlobalSecondaryIndexUpdates,
+            provider_config=self.provider_config,
+            adapter=self.adapter,
+        )
+
+    def delete_table(self) -> Dict[str, Any]:
+        return delete_table(
+            self.table_name, provider_config=self.provider_config, adapter=self.adapter
+        )
+
+    def update_time_to_live(self, TimeToLiveSpecification: Dict[str, Any]) -> Dict[str, Any]:
+        return update_time_to_live(
+            self.table_name,
+            TimeToLiveSpecification,
+            provider_config=self.provider_config,
+            adapter=self.adapter,
+        )
+
 
 class _NativeBatchWriter:
     """Context manager that accumulates put/delete and flushes via
@@ -797,6 +861,125 @@ def get_native_table(table_name: str) -> NativeDynamoTable:
         tbl = NativeDynamoTable(table_name, provider_config=native_provider_config())
         _NATIVE_TABLE_CACHE[table_name] = tbl
     return tbl
+
+
+# ---------------------------------------------------------------------------
+# Schema management (resource/client-level, boto3-shaped). These mirror
+# ``dynamodb.create_table`` / ``dynamodb.meta.client.*`` so the app's _init_db
+# and migrations can route through the adapter without boto3. GSI/LSI are
+# defined at CreateTable (ScyllaDB Alternator does not support GSI-add via
+# UpdateTable). The Go exports are client-level: they work before a table exists.
+# ---------------------------------------------------------------------------
+
+def _schema_config(provider_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return provider_config if provider_config is not None else native_provider_config()
+
+
+def create_table(
+    TableName: str,
+    KeySchema: List[Dict[str, Any]],
+    AttributeDefinitions: List[Dict[str, Any]],
+    GlobalSecondaryIndexes: Optional[List[Dict[str, Any]]] = None,
+    LocalSecondaryIndexes: Optional[List[Dict[str, Any]]] = None,
+    BillingMode: str = "PAY_PER_REQUEST",
+    ProvisionedThroughput: Optional[Dict[str, Any]] = None,
+    provider_config: Optional[Dict[str, Any]] = None,
+    adapter: Optional[CloudAdapterBase] = None,
+) -> Dict[str, Any]:
+    """Create a table with GSI/LSI via the adapter (boto3 ``create_table`` shape).
+
+    GSI/LSI definitions are forwarded intact to the Go ``NativeCreateTable``.
+    """
+    args = {
+        "config": _schema_config(provider_config),
+        "table_name": TableName,
+        "key_schema": json.dumps(KeySchema, default=str),
+        "attribute_definitions": json.dumps(AttributeDefinitions, default=str),
+        "global_secondary_indexes": json.dumps(GlobalSecondaryIndexes, default=str) if GlobalSecondaryIndexes else "",
+        "local_secondary_indexes": json.dumps(LocalSecondaryIndexes, default=str) if LocalSecondaryIndexes else "",
+        "billing_mode": BillingMode or "",
+        "provisioned_throughput": json.dumps(ProvisionedThroughput, default=str) if ProvisionedThroughput else "",
+    }
+    return (adapter or CloudAdapterBase())._call_go_function(
+        "NativeCreateTable", args, error_prefix=f"NativeCreateTable({TableName})"
+    )
+
+
+def describe_table(
+    TableName: str,
+    provider_config: Optional[Dict[str, Any]] = None,
+    adapter: Optional[CloudAdapterBase] = None,
+) -> Dict[str, Any]:
+    """Describe a table; returns ``{'Table': {...}}`` (boto3 shape)."""
+    result = (adapter or CloudAdapterBase())._call_go_function(
+        "NativeDescribeTable",
+        {"config": _schema_config(provider_config), "table_name": TableName},
+        error_prefix=f"NativeDescribeTable({TableName})",
+    )
+    table = result.get("table") if isinstance(result, dict) else None
+    return {"Table": table or {}}
+
+
+def update_table(
+    TableName: str,
+    BillingMode: Optional[str] = None,
+    ProvisionedThroughput: Optional[Dict[str, Any]] = None,
+    GlobalSecondaryIndexes: Optional[List[Dict[str, Any]]] = None,
+    GlobalSecondaryIndexUpdates: Optional[List[Dict[str, Any]]] = None,
+    provider_config: Optional[Dict[str, Any]] = None,
+    adapter: Optional[CloudAdapterBase] = None,
+) -> Dict[str, Any]:
+    """Update billing mode / provisioned throughput only.
+
+    Adding GSI via UpdateTable is rejected (``unsupported_operation``): GSI must
+    be created at CreateTable (Alternator limitation).
+    """
+    if GlobalSecondaryIndexUpdates or GlobalSecondaryIndexes:
+        raise DatabaseError(
+            "GSI must be created at CreateTable; Alternator does not support "
+            "GSI-add via UpdateTable",
+            code="unsupported_operation",
+        )
+    args = {
+        "config": _schema_config(provider_config),
+        "table_name": TableName,
+        "billing_mode": BillingMode or "",
+        "provisioned_throughput": json.dumps(ProvisionedThroughput, default=str) if ProvisionedThroughput else "",
+        "global_secondary_index_updates": "",
+    }
+    return (adapter or CloudAdapterBase())._call_go_function(
+        "NativeUpdateTable", args, error_prefix=f"NativeUpdateTable({TableName})"
+    )
+
+
+def delete_table(
+    TableName: str,
+    provider_config: Optional[Dict[str, Any]] = None,
+    adapter: Optional[CloudAdapterBase] = None,
+) -> Dict[str, Any]:
+    """Delete a table via the adapter."""
+    return (adapter or CloudAdapterBase())._call_go_function(
+        "NativeDeleteTable",
+        {"config": _schema_config(provider_config), "table_name": TableName},
+        error_prefix=f"NativeDeleteTable({TableName})",
+    )
+
+
+def update_time_to_live(
+    TableName: str,
+    TimeToLiveSpecification: Dict[str, Any],
+    provider_config: Optional[Dict[str, Any]] = None,
+    adapter: Optional[CloudAdapterBase] = None,
+) -> Dict[str, Any]:
+    """Enable/disable TTL (``{'Enabled': bool, 'AttributeName': str}``)."""
+    args = {
+        "config": _schema_config(provider_config),
+        "table_name": TableName,
+        "time_to_live_specification": json.dumps(TimeToLiveSpecification, default=str),
+    }
+    return (adapter or CloudAdapterBase())._call_go_function(
+        "NativeUpdateTimeToLive", args, error_prefix=f"NativeUpdateTimeToLive({TableName})"
+    )
 
 
 def migrate_table(

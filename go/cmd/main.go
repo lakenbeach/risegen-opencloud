@@ -960,6 +960,170 @@ func CloudAdapter_NativeBatchWrite(argsJSON *C.char) *C.char {
 	return reply(map[string]interface{}{"written": len(putItems) + len(deleteKeys)})
 }
 
+// --- Native schema management (client-level; no pre-existing table handle) --
+
+// nativeClientFromConfig opens a native DynamoDB client from a provider config
+// map (endpoint/region/access_key_id/secret_access_key). Schema operations use
+// this directly so they work before any table exists.
+func nativeClientFromConfig(config map[string]interface{}) (*adapter.NativeDynamoClient, error) {
+	str := func(k string) string {
+		if v, ok := config[k]; ok {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+		return ""
+	}
+	return adapter.OpenNativeDynamoClient(
+		str("endpoint"), str("region"), str("access_key_id"), str("secret_access_key"),
+	)
+}
+
+//export CloudAdapter_NativeCreateTable
+func CloudAdapter_NativeCreateTable(argsJSON *C.char) *C.char {
+	var args struct {
+		Config                 map[string]interface{} `json:"config"`
+		TableName              string                 `json:"table_name"`
+		KeySchema              string                 `json:"key_schema"`
+		AttributeDefinitions   string                 `json:"attribute_definitions"`
+		GlobalSecondaryIndexes string                 `json:"global_secondary_indexes"`
+		LocalSecondaryIndexes  string                 `json:"local_secondary_indexes"`
+		BillingMode            string                 `json:"billing_mode"`
+		ProvisionedThroughput  string                 `json:"provisioned_throughput"`
+	}
+	if err := parseArgs(C.GoString(argsJSON), &args); err != nil {
+		return errorReply("invalid_input", err.Error())
+	}
+	client, err := nativeClientFromConfig(args.Config)
+	if err != nil {
+		return fail(err)
+	}
+	ks, err := adapter.ParseKeySchema(args.KeySchema)
+	if err != nil {
+		return errorReply("invalid_input", fmt.Sprintf("invalid key_schema JSON: %v", err))
+	}
+	ad, err := adapter.ParseAttributeDefinitions(args.AttributeDefinitions)
+	if err != nil {
+		return errorReply("invalid_input", fmt.Sprintf("invalid attribute_definitions JSON: %v", err))
+	}
+	gsis, err := adapter.ParseGlobalSecondaryIndexes(args.GlobalSecondaryIndexes)
+	if err != nil {
+		return errorReply("invalid_input", fmt.Sprintf("invalid global_secondary_indexes JSON: %v", err))
+	}
+	lsis, err := adapter.ParseLocalSecondaryIndexes(args.LocalSecondaryIndexes)
+	if err != nil {
+		return errorReply("invalid_input", fmt.Sprintf("invalid local_secondary_indexes JSON: %v", err))
+	}
+	tp, err := adapter.ParseProvisionedThroughput(args.ProvisionedThroughput)
+	if err != nil {
+		return errorReply("invalid_input", fmt.Sprintf("invalid provisioned_throughput JSON: %v", err))
+	}
+	if err := adapter.NativeCreateTable(
+		ctx(), client, args.TableName, ks, ad, gsis, lsis, args.BillingMode, tp,
+	); err != nil {
+		return fail(err)
+	}
+	return reply(map[string]interface{}{"created": true})
+}
+
+//export CloudAdapter_NativeDescribeTable
+func CloudAdapter_NativeDescribeTable(argsJSON *C.char) *C.char {
+	var args struct {
+		Config    map[string]interface{} `json:"config"`
+		TableName string                 `json:"table_name"`
+	}
+	if err := parseArgs(C.GoString(argsJSON), &args); err != nil {
+		return errorReply("invalid_input", err.Error())
+	}
+	client, err := nativeClientFromConfig(args.Config)
+	if err != nil {
+		return fail(err)
+	}
+	desc, err := adapter.NativeDescribeTable(ctx(), client, args.TableName)
+	if err != nil {
+		return fail(err)
+	}
+	return reply(map[string]interface{}{"table": desc})
+}
+
+//export CloudAdapter_NativeUpdateTable
+func CloudAdapter_NativeUpdateTable(argsJSON *C.char) *C.char {
+	var args struct {
+		Config                      map[string]interface{} `json:"config"`
+		TableName                   string                 `json:"table_name"`
+		BillingMode                 string                 `json:"billing_mode"`
+		ProvisionedThroughput       string                 `json:"provisioned_throughput"`
+		GlobalSecondaryIndexUpdates string                 `json:"global_secondary_index_updates"`
+	}
+	if err := parseArgs(C.GoString(argsJSON), &args); err != nil {
+		return errorReply("invalid_input", err.Error())
+	}
+	if args.GlobalSecondaryIndexUpdates != "" {
+		return errorReply("unsupported_operation",
+			"GSI must be created at CreateTable; Alternator does not support GSI-add via UpdateTable")
+	}
+	client, err := nativeClientFromConfig(args.Config)
+	if err != nil {
+		return fail(err)
+	}
+	tp, err := adapter.ParseProvisionedThroughput(args.ProvisionedThroughput)
+	if err != nil {
+		return errorReply("invalid_input", fmt.Sprintf("invalid provisioned_throughput JSON: %v", err))
+	}
+	if err := adapter.NativeUpdateTable(ctx(), client, args.TableName, args.BillingMode, tp); err != nil {
+		return fail(err)
+	}
+	return reply(map[string]interface{}{"updated": true})
+}
+
+//export CloudAdapter_NativeDeleteTable
+func CloudAdapter_NativeDeleteTable(argsJSON *C.char) *C.char {
+	var args struct {
+		Config    map[string]interface{} `json:"config"`
+		TableName string                 `json:"table_name"`
+	}
+	if err := parseArgs(C.GoString(argsJSON), &args); err != nil {
+		return errorReply("invalid_input", err.Error())
+	}
+	client, err := nativeClientFromConfig(args.Config)
+	if err != nil {
+		return fail(err)
+	}
+	if err := adapter.NativeDeleteTable(ctx(), client, args.TableName); err != nil {
+		return fail(err)
+	}
+	return reply(map[string]interface{}{"deleted": true})
+}
+
+//export CloudAdapter_NativeUpdateTimeToLive
+func CloudAdapter_NativeUpdateTimeToLive(argsJSON *C.char) *C.char {
+	var args struct {
+		Config                  map[string]interface{} `json:"config"`
+		TableName               string                 `json:"table_name"`
+		TimeToLiveSpecification string                 `json:"time_to_live_specification"`
+	}
+	if err := parseArgs(C.GoString(argsJSON), &args); err != nil {
+		return errorReply("invalid_input", err.Error())
+	}
+	var spec struct {
+		Enabled       bool   `json:"Enabled"`
+		AttributeName string `json:"AttributeName"`
+	}
+	if args.TimeToLiveSpecification != "" {
+		if err := json.Unmarshal([]byte(args.TimeToLiveSpecification), &spec); err != nil {
+			return errorReply("invalid_input", fmt.Sprintf("invalid time_to_live_specification JSON: %v", err))
+		}
+	}
+	client, err := nativeClientFromConfig(args.Config)
+	if err != nil {
+		return fail(err)
+	}
+	if err := adapter.NativeUpdateTimeToLive(ctx(), client, args.TableName, spec.Enabled, spec.AttributeName); err != nil {
+		return fail(err)
+	}
+	return reply(map[string]interface{}{"updated": true})
+}
+
 // --- Secrets ---------------------------------------------------------------
 
 //export CloudAdapter_InitSecretStore
