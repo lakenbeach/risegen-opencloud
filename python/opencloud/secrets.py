@@ -2,8 +2,9 @@
 SecretStore Interface - Python wrapper for Go CDK secrets management operations.
 
 Provides a Pythonic interface for secrets operations (get, set) that works across
-AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and HashiCorp Vault
-via the Go shared library.
+AWS Secrets Manager, AWS SSM Parameter Store, GCP Secret Manager, and file/HTTP
+secrets via the Go shared library. Azure Key Vault and HashiCorp Vault are NOT
+covered by the Go bridge; they require a custom provider extension.
 
 All operations go through Go CDK - no direct SDK imports.
 Encryption/decryption is handled transparently by the provider.

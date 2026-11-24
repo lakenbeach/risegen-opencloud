@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"gocloud.dev/runtimevar"
+	_ "gocloud.dev/runtimevar/awsparamstore"
 	_ "gocloud.dev/runtimevar/awssecretsmanager"
 	_ "gocloud.dev/runtimevar/filevar"
 	_ "gocloud.dev/runtimevar/gcpsecretmanager"
@@ -54,7 +55,7 @@ type SecretValue struct {
 }
 
 // OpenSecretStore opens a variable watcher for a secret.
-// Supports AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, and file-based secrets.
+// Supports AWS Secrets Manager, AWS SSM Parameter Store, GCP Secret Manager, and file/HTTP-based secrets.
 func OpenSecretStore(ctx context.Context, config SecretsConfig) (*runtimevar.Variable, error) {
 	logger := slog.Default()
 
